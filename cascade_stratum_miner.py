@@ -306,7 +306,7 @@ for gpu in gpus:
         f"{gpu['free_vram_gb']:.1f}/{gpu['total_vram_gb']:.1f} GB"
     )
 
-CASCADE_DEPTH = 28
+CASCADE_DEPTH = 2000
 THREADS_PER_GPU = 1 << CASCADE_DEPTH
 TPB = 256
 BPG = (THREADS_PER_GPU + TPB - 1) // TPB
