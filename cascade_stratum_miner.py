@@ -67,7 +67,7 @@ def detect_gpu_config(vram_budget_pct=0.80):
     usable_vram = int(free_mem * vram_budget_pct)
     max_cascade_depth = int(math.log2(usable_vram / 24)) if usable_vram > 24 else 10
     # Cap at 30 (1B leaves) for sanity; verify kernel batch size
-    max_cascade_depth = min(max_cascade_depth, 30)
+    max_cascade_depth = min(max_cascade_depth, 250)
 
     # Verify kernel TPB (heavier register usage than cascade)
     candidate_tpb = [t for t in [64, 128, 256, 512] if t <= max_threads_per_block]
