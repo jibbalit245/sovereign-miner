@@ -43,7 +43,7 @@ def swap_endian_words(hex_str):
 
 def difficulty_to_target(difficulty):
     diff1_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    return diff1_target // max(int(difficulty), 1)
+    return max(int(diff1_target / max(float(difficulty), 1.0)), 1)
 
 
 def target_to_gpu_words(target_int):
@@ -52,6 +52,11 @@ def target_to_gpu_words(target_int):
     for i in range(8):
         words[i] = struct.unpack(">I", target_bytes[i * 4:(i + 1) * 4])[0]
     return words
+
+
+def header_meets_target(header_prefix, nonce, target_int):
+    header = header_prefix + struct.pack(">I", nonce)
+    return int.from_bytes(dsha256(header), byteorder="little") <= target_int
 
 
 # -------------------------------------------------------------
@@ -101,6 +106,12 @@ __constant__ uint32_t H_INIT[8] = {
 };
 
 __device__ __forceinline__ uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+__device__ __forceinline__ uint32_t bswap32(uint32_t x) {
+    return ((x & 0x000000FFu) << 24) |
+           ((x & 0x0000FF00u) << 8) |
+           ((x & 0x00FF0000u) >> 8) |
+           ((x & 0xFF000000u) >> 24);
+}
 __device__ __forceinline__ uint32_t sigma0(uint32_t x) { return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3); }
 __device__ __forceinline__ uint32_t sigma1(uint32_t x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10); }
 
@@ -211,11 +222,12 @@ extern "C" __global__ void cascade_mine(
     compress(H, W);
 
     for (int i = 0; i < 8; i++) {
-        if (H[i] < target_words[i]) {
+        uint32_t hash_word = bswap32(H[7 - i]);
+        if (hash_word < target_words[i]) {
             if (atomicCAS(output_flag, 0, 1) == 0) *output_nonce = nonce;
             return;
         }
-        if (H[i] > target_words[i]) return;
+        if (hash_word > target_words[i]) return;
     }
 
     if (atomicCAS(output_flag, 0, 1) == 0) *output_nonce = nonce;
@@ -402,19 +414,24 @@ print(f"[Bench] {med_time * 1000:.1f} ms/batch | {effective_hps / 1e9:.3f} GH/s 
 # -------------------------------------------------------------
 # 7. STRATUM
 # -------------------------------------------------------------
-def parse_stratum(socket_obj, request_payload=None):
+def parse_stratum(socket_obj, request_payload=None, expected_id=None, buffer=""):
     if request_payload:
         socket_obj.sendall(request_payload.encode("utf-8") + b"\n")
-    buffer = ""
+    preserved = []
     while True:
         try:
             buffer += socket_obj.recv(4096).decode("utf-8")
-            if "\n" in buffer:
+            while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                if line.strip():
-                    return json.loads(line), buffer
+                if not line.strip():
+                    continue
+                msg = json.loads(line)
+                if expected_id is None or msg.get("id") == expected_id:
+                    preserved_buffer = "".join(preserved)
+                    return msg, preserved_buffer + buffer
+                preserved.append(line + "\n")
         except socket.timeout:
-            return None, buffer
+            return None, "".join(preserved) + buffer
 
 
 # -------------------------------------------------------------
@@ -431,10 +448,15 @@ def stratum_mining_loop():
         sock.connect(POOL_FALLBACK)
         print(f"[Network] Connected to {POOL_FALLBACK[0]}:{POOL_FALLBACK[1]}")
 
-    sub_res, buffer = parse_stratum(sock, '{"id":1,"method":"mining.subscribe","params":[]}')
+    sub_res, buffer = parse_stratum(sock, '{"id":1,"method":"mining.subscribe","params":[]}', expected_id=1)
     extranonce1 = sub_res["result"][1]
     en2_sz = sub_res["result"][2]
-    parse_stratum(sock, f'{{"id":2,"method":"mining.authorize","params":["{WALLET}","x"]}}')
+    _, buffer = parse_stratum(
+        sock,
+        f'{{"id":2,"method":"mining.authorize","params":["{WALLET}","x"]}}',
+        expected_id=2,
+        buffer=buffer,
+    )
     print(f"[Stratum] Authorized | extranonce2 bytes={en2_sz}")
 
     active_job = None
@@ -443,6 +465,9 @@ def stratum_mining_loop():
     total_hashes = 0
     session_start = time.time()
     batch_id = 0
+    submitted_shares = set()
+    next_submit_id = 4
+    pending_submits = {}
 
     while True:
         sock.setblocking(False)
@@ -468,9 +493,14 @@ def stratum_mining_loop():
                 active_job = msg["params"]
                 extranonce2_int = 0
                 batch_id = 0
+                submitted_shares.clear()
                 print(f"[Job] {active_job[0]}")
-            elif msg.get("id") == 4:
-                print(f"[Share] {'ACCEPTED' if msg.get('result') else f'REJECTED {msg.get('error')}'}")
+            elif msg.get("id") in pending_submits:
+                share_label = pending_submits.pop(msg["id"])
+                print(
+                    f"[Share] {share_label} | "
+                    f"{'ACCEPTED' if msg.get('result') else f'REJECTED {msg.get('error')}'}"
+                )
 
         if active_job is None:
             time.sleep(0.25)
@@ -495,7 +525,9 @@ def stratum_mining_loop():
 
         midstate_cpu = compute_midstate(header_words[:16])
         tail_cpu = header_words[16:19].copy()
-        target_cpu = target_to_gpu_words(difficulty_to_target(pool_difficulty))
+        target_int = difficulty_to_target(pool_difficulty)
+        target_cpu = target_to_gpu_words(target_int)
+        header_prefix = header_bytes[:76]
 
         for idx, gpu in enumerate(gpus):
             with cp.cuda.Device(gpu["id"]):
@@ -543,12 +575,22 @@ def stratum_mining_loop():
                     nonce = int(gpu_nonces[idx].get()[0])
                     nonce_hex = hex(nonce)[2:].zfill(8)
                     nonce_submit = "".join(reversed([nonce_hex[i:i + 2] for i in range(0, 8, 2)]))
+                    share_key = (job_id, extranonce2, ntime, nonce_submit)
+                    if share_key in submitted_shares:
+                        continue
+                    if not header_meets_target(header_prefix, nonce, target_int):
+                        print(f"[Share] Dropped invalid GPU hit on GPU {gpu['id']} nonce={nonce_submit}")
+                        continue
+                    submit_id = next_submit_id
+                    next_submit_id += 1
                     submit = {
                         "params": [WALLET, job_id, extranonce2, ntime, nonce_submit],
-                        "id": 4,
+                        "id": submit_id,
                         "method": "mining.submit",
                     }
                     sock.sendall(json.dumps(submit).encode("utf-8") + b"\n")
+                    submitted_shares.add(share_key)
+                    pending_submits[submit_id] = f"GPU {gpu['id']} nonce={nonce_submit} batch={batch_id}"
                     print(f"[Share] GPU {gpu['id']} nonce={nonce_submit} batch={batch_id}")
                     found_share = True
 
